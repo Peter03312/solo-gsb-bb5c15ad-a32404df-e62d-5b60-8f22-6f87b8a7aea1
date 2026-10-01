@@ -16,6 +16,9 @@ from app.schemas import (
     PlanComputeIn,
     PlanConfirmIn,
     PlanOut,
+    ReblockCreateIn,
+    ReblockMovedOut,
+    ReblockOut,
     ScheduleCreateIn,
     ScheduleEntryOut,
     ScheduleOut,
@@ -171,6 +174,29 @@ def amend_plan(plan_id: str, body: PlanAmendIn, db: Session = Depends(get_db)):
 def confirm_plan(plan_id: str, body: PlanConfirmIn, db: Session = Depends(get_db)):
     plan = services.confirm_plan(db, plan_id, body)
     return _plan_out(plan)
+
+
+@router.post(
+    "/plans/{plan_id}/reblock",
+    response_model=ReblockOut,
+    status_code=201,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="码头临时封锁槽位时，按已确认方案计算应急改配草稿"
+    "（先最少换槽、再最低占用层、最后槽位序列字典序最小；无解不保存）",
+)
+def reblock_plan(plan_id: str, body: ReblockCreateIn, db: Session = Depends(get_db)):
+    plan, moved = services.create_reblock_draft(db, plan_id, body)
+    return ReblockOut(
+        **_plan_out(plan).model_dump(),
+        base_plan_id=plan_id,
+        unavailable_slots=list(body.unavailable_slots),
+        moved_count=len(moved),
+        moved_containers=[
+            ReblockMovedOut(container_no=no, from_slot=frm, to_slot=to)
+            for no, frm, to in moved
+        ],
+    )
 
 
 @router.get("/plans", response_model=list[PlanOut], summary="列出全部方案")

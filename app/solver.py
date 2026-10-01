@@ -16,6 +16,10 @@
    （分块基数编码：每块的槽位序号以 B=槽位数+1 为基数编入单个整数目标，
    顺序固定各块；数学上与完整字典序最小严格等价，同时把系数控制在
    双精度可精确表示的范围内）。
+
+另提供 :func:`solve_reblock` 应急改配：部分槽位临时封锁后保持全部箱
+重新配载，优选次序为 ① 相对原方案换槽箱数最少、② 最高占用层最小、
+③ 箱号升序槽位序列字典序最小。
 """
 
 from __future__ import annotations
@@ -96,12 +100,20 @@ def _build_model(
     fixed: Mapping[str, str] | None = None,
     t_bound: int | None = None,
     lex_boxes: Sequence[str] | None = None,
+    banned_slots: frozenset[str] = frozenset(),
+    original: Mapping[str, str] | None = None,
+    moves_bound: int | None = None,
+    minimize_moves: bool = False,
 ) -> tuple[pulp.LpProblem, dict, pulp.LpVariable, dict[str, Slot]]:
     """构建 MILP。
 
     * fixed: 箱号 -> 槽位编号（已固定分配）；
     * t_bound: 约束 T <= t_bound；
-    * lex_boxes: 目标改为该箱号序列（按重要性从高到低）的槽位序号字典序加权和。
+    * lex_boxes: 目标改为该箱号序列（按重要性从高到低）的槽位序号字典序加权和；
+    * banned_slots: 不可用（封锁）槽位，任何箱不得占用；
+    * original: 原方案 箱号 -> 槽位编号（应急改配时用于换槽计数）；
+    * moves_bound: 相对原方案换槽箱数上界；
+    * minimize_moves: 目标改为最小化换槽箱数（优先于其他目标参数）。
     """
     fixed = fixed or {}
     slot_by_code = {s.code: s for s in slots}
@@ -118,7 +130,12 @@ def _build_model(
 
     max_tier = max((s.tier for s in slots), default=0)
     T = pulp.LpVariable("T", lowBound=0, upBound=max_tier, cat="Integer")
-    if lex_boxes:
+    if minimize_moves:
+        # 换槽箱数 = 箱数 - 仍占原槽的箱数；常数不影响优化，省略
+        prob += pulp.lpSum(
+            -x[c.no, original[c.no]] for c in containers
+        ), "min_moves"
+    elif lex_boxes:
         # 基数编码字典序；调用方保证系数在双精度精确整数范围内
         base = len(slots) + 1
         k = len(lex_boxes)
@@ -139,6 +156,19 @@ def _build_model(
     # 固定分配
     for cno, scode in fixed.items():
         prob += x[cno, scode] == 1, f"fix_{cno}"
+
+    # 不可用槽位不得占用
+    for s in slots:
+        if s.code in banned_slots:
+            prob += y[s.code] == 0, f"banned_{s.code}"
+
+    # 换槽箱数上界：仍占原槽的箱数 >= 箱数 - moves_bound
+    if moves_bound is not None:
+        prob += (
+            pulp.lpSum(x[c.no, original[c.no]] for c in containers)
+            >= len(containers) - moves_bound,
+            "moves_bound",
+        )
 
     # 承重
     for s in slots:
@@ -315,6 +345,142 @@ def solve_stowage(
         prob, x, _, sbc = _build_model(
             containers, slots, adj_set, incompat, min_moment, max_moment,
             fixed=fixed, t_bound=t_star, lex_boxes=block,
+        )
+        status = _solve(prob)
+        if status != "Optimal":
+            raise InfeasibleStowage("字典序优化失败，请重试")
+        for cno in block:
+            for scode in sorted(sbc):
+                if pulp.value(x[cno, scode]) is not None and pulp.value(x[cno, scode]) > 0.5:
+                    fixed[cno] = scode
+                    break
+        last_x, last_sbc = x, sbc
+
+    m2 = pulp.lpSum(
+        c.weight * last_sbc[scode].arm * last_x[c.no, scode]
+        for c in containers
+        for scode in last_sbc
+    )
+    return _extract(containers, last_sbc, last_x, pulp.value(m2), t_star)
+
+
+def solve_reblock(
+    containers: Sequence[Container],
+    slots: Sequence[Slot],
+    adjacency: Sequence[tuple[str, str]] | set[tuple[str, str]],
+    incompatible_classes: Sequence[tuple[str, str]],
+    min_moment: float,
+    max_moment: float,
+    original: Mapping[str, str],
+    banned_slots: Sequence[str] | frozenset[str],
+) -> SolveResult:
+    """应急改配：部分槽位临时封锁后，保持全部箱重新配载。
+
+    约束与 :func:`solve_stowage` 完全相同（承重、堆叠支撑、重量次序、
+    卸港先后、危险类别相邻、总力矩区间），另加不可用槽位不得占用；
+    箱清单与槽位资料均沿用原方案所用修订。
+
+    优选次序：
+
+    1. 相对原方案换槽的箱数最少；
+    2. 换槽数相同时，最高占用层最小；
+    3. 再按箱号升序取槽位编号序列字典序最小（分块基数编码，与
+       :func:`solve_stowage` 第二阶段同一技术，严格等价完整字典序）。
+
+    无完整可行改配时抛出 :class:`InfeasibleStowage`。
+    """
+    banned = frozenset(banned_slots)
+    codes = {s.code for s in slots}
+    unknown = sorted(banned - codes)
+    if unknown:
+        raise InfeasibleStowage(
+            f"不可用槽位编号不属于该槽位资料修订：{', '.join(unknown)}"
+        )
+    missing = [c.no for c in containers if c.no not in original]
+    if missing:
+        raise InfeasibleStowage(
+            f"原方案缺少箱 {', '.join(missing)} 的槽位记录，无法改配"
+        )
+    original = {c.no: original[c.no] for c in containers}
+    unknown_orig = sorted({original[c.no] for c in containers} - codes)
+    if unknown_orig:
+        raise InfeasibleStowage(
+            f"原方案槽位 {', '.join(unknown_orig)} 不在该槽位资料修订中，无法改配"
+        )
+
+    available = [s for s in slots if s.code not in banned]
+    if len(containers) > len(available):
+        raise InfeasibleStowage(
+            f"封锁 {len(banned)} 个槽位后仅剩 {len(available)} 个可用槽位，"
+            f"少于箱数 {len(containers)}，无法完整改配"
+        )
+    cap_max = max((s.capacity for s in available), default=0.0)
+    for c in containers:
+        if c.weight > cap_max:
+            raise InfeasibleStowage(
+                f"箱 {c.no} 重量 {c.weight} 超过封锁后任一可用槽位承重，无法改配"
+            )
+
+    adj_set = {tuple(sorted(p)) for p in adjacency}
+    incompat = {tuple(sorted(p)) for p in incompatible_classes}
+
+    if not containers:
+        if min_moment <= 0 <= max_moment:
+            return SolveResult([], 0.0, 0)
+        raise InfeasibleStowage(
+            f"无箱时总力矩为 0，不在允许区间 [{min_moment}, {max_moment}] 内"
+        )
+
+    # 第一阶段：最小化相对原方案换槽的箱数
+    prob1, x1, _, _ = _build_model(
+        containers, slots, adj_set, incompat, min_moment, max_moment,
+        banned_slots=banned, original=original, minimize_moves=True,
+    )
+    status = _solve(prob1)
+    if status == "Infeasible":
+        raise InfeasibleStowage(
+            "封锁不可用槽位后，不存在满足承重、堆叠、重量次序、卸港先后、"
+            "危险类别相邻限制且总力矩处于允许区间的完整改配方案"
+        )
+    if status != "Optimal":
+        raise InfeasibleStowage(
+            f"求解器在 {TIME_LIMIT}s 内未能判定可行改配（状态：{status}），"
+            "请缩小规模或重试"
+        )
+    moves_star = sum(
+        1 for c in containers
+        if pulp.value(x1[c.no, original[c.no]]) is None
+        or pulp.value(x1[c.no, original[c.no]]) < 0.5
+    )
+
+    # 第二阶段：固定换槽数，最小化最高占用层
+    prob2, x2, T2, sbc2 = _build_model(
+        containers, slots, adj_set, incompat, min_moment, max_moment,
+        banned_slots=banned, original=original, moves_bound=moves_star,
+    )
+    status = _solve(prob2)
+    if status != "Optimal":
+        raise InfeasibleStowage(
+            f"改配层数优化未能完成（求解状态：{status}），请重试"
+        )
+    t_star = int(round(pulp.value(T2)))
+
+    # 第三阶段：固定换槽数与最高占用层，按箱号升序分块求槽位序列字典序最小
+    ordered_cnos = [c.no for c in sorted(containers, key=lambda c: c.no)]
+    n_slots = len(slots)
+    # (n_slots+1)^chunk 控制在约 1e13：双精度下系数为精确整数
+    digits = max(1, len(str(n_slots)))
+    chunk = max(1, 13 // digits)
+    fixed: dict[str, str] = {}
+    last_x = x2
+    last_sbc = sbc2
+
+    for start in range(0, len(ordered_cnos), chunk):
+        block = ordered_cnos[start:start + chunk]
+        prob, x, _, sbc = _build_model(
+            containers, slots, adj_set, incompat, min_moment, max_moment,
+            fixed=fixed, t_bound=t_star, lex_boxes=block,
+            banned_slots=banned, original=original, moves_bound=moves_star,
         )
         status = _solve(prob)
         if status != "Optimal":
