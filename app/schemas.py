@@ -161,6 +161,60 @@ class PlanConfirmIn(BaseModel):
     manifest_revision: int = Field(..., description="确认时核对的箱清单修订号")
 
 
+# ---------- 应急改配 ----------
+
+
+class RestowCreateIn(BaseModel):
+    blocked_slots: list[str] = Field(
+        ...,
+        min_length=1,
+        description="临时封锁、不可占用的槽位编号列表；须均属于当前最新槽位资料修订，"
+                    "不得为空或含重复编号",
+    )
+
+    @field_validator("blocked_slots")
+    @classmethod
+    def _blocked_slots(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("不可用槽位编号列表不能为空")
+        cleaned: list[str] = []
+        for code in v:
+            if not isinstance(code, str) or not code.strip():
+                raise ValueError("槽位编号不能为空")
+            cleaned.append(code.strip())
+        if len(set(cleaned)) != len(cleaned):
+            dup = sorted({c for c in cleaned if cleaned.count(c) > 1})
+            raise ValueError(f"槽位编号重复：{', '.join(dup)}")
+        return cleaned
+
+
+class RestowMoveOut(BaseModel):
+    container_no: str
+    from_slot_code: str = Field(..., description="原方案槽位编号")
+    to_slot_code: str = Field(..., description="改配后槽位编号")
+    from_stack: str
+    to_stack: str
+    from_tier: int
+    to_tier: int
+
+
+class RestowOut(BaseModel):
+    plan_id: str = Field(..., description="新应急改配草稿方案 ID")
+    revision_no: int = Field(..., description="草稿方案修订号（同方案链递增）")
+    status: str
+    root_id: str
+    parent_id: str
+    slots_revision: int = Field(..., description="改配所用最新槽位资料修订号")
+    manifest_revision: int = Field(..., description="改配所用最新箱清单修订号")
+    blocked_slots: list[str]
+    moved_boxes: int = Field(..., description="相对原确认方案换槽的箱数")
+    max_occupied_tier: int
+    total_moment: float
+    assignments: list[AssignmentOut]
+    moves: list[RestowMoveOut]
+    created_at: str
+
+
 # ---------- 装船时间表 ----------
 
 

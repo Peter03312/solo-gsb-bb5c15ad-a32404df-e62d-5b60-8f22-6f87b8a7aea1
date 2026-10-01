@@ -182,7 +182,94 @@ curl -s "$BASE/unloading?historical=true"
 curl -s $BASE/plans/<plan_id>/unloading
 ```
 
-## 六、启动
+## 六、应急改配（码头临时封锁槽位）
+
+码头临时封锁槽位时，按**当前已确认方案 ID** 与**不可用槽位编号列表**计算应急改配草稿。
+
+### 前置条件（不满足返回 `409`，不保存）
+
+1. 基础方案必须为当前 **`confirmed`** 方案（`draft`/`superseded` 拒绝）；
+2. 该方案所用**槽位资料修订**与**箱清单修订**均须为各自的**当前最新修订**
+   （资料已更新时，请先按最新资料走 `amend` → `confirm` 再申请应急改配）。
+
+### 提交字段（`POST /api/plans/{plan_id}/restow`，请求体亦见 `examples/restow.json`）
+
+| 字段 | 含义 |
+| --- | --- |
+| `blocked_slots` | 临时封锁、不可占用的槽位编号列表；**不得为空、不得含重复编号、不得含空白编号**（入参校验失败返回 `422`） |
+
+- 编号须**属于该方案所用槽位资料修订**，未知编号返回 `422`（中文说明，不保存）；
+- 封锁列表可包含原本就空着的槽位（此时若无需调整，换槽箱数为 0）。
+
+### 硬性约束（与第一章完全一致，另加封锁约束）
+
+1. **保持原方案全部箱及资料**：以当前最新槽位资料修订与箱清单修订参与计算，箱一个不增不减；
+2. **不可用槽位不得占用**（原槽被封的箱必然换槽；其余箱在可行时原位保留）；
+3. 继续满足**承重、堆叠支撑、重量次序、卸港先后、危险类别相邻、总力矩**全部既有约束。
+
+### 优选规则（三阶段，整数规划 PuLP/CBC）
+
+1. **最小化相对原方案换槽的箱数**（箱槽与原方案不同即记一次换槽）；
+2. 换槽箱数相同时，**最小化最高占用层**；
+3. 再相同时，**按箱号升序取槽位编号序列字典序最小**。
+
+求解结果在服务内再以 Python 对全部硬约束逐步复核（含封锁槽占用、原槽被封箱必换），不盲信求解器容差。
+
+### 响应示例
+
+```json
+{
+  "plan_id": "9c77...",
+  "revision_no": 2,
+  "status": "draft",
+  "root_id": "2f1e529a...",
+  "parent_id": "2f1e529a...",
+  "slots_revision": 1,
+  "manifest_revision": 1,
+  "blocked_slots": ["B01"],
+  "moved_boxes": 1,
+  "max_occupied_tier": 1,
+  "total_moment": 60.0,
+  "assignments": [
+    {"container_no": "C001", "slot_code": "A01", "stack": "A", "tier": 1},
+    {"container_no": "C002", "slot_code": "C01", "stack": "C", "tier": 1}
+  ],
+  "moves": [
+    {"container_no": "C002", "from_slot_code": "B01", "to_slot_code": "C01",
+     "from_stack": "B", "to_stack": "C", "from_tier": 1, "to_tier": 1}
+  ],
+  "created_at": "..."
+}
+```
+
+### 保存与生命周期
+
+- 草稿为方案链上的**新方案修订**（`revision_no = 基础方案修订号 + 1`，同 `root_id`、`parent_id` 指向基础方案），状态 `draft`；
+- **草稿不占用任何槽位、不改变原确认方案**：`confirmed_slots` 不动，原确认方案在新草稿确认前**持续有效**；
+- **无完整可行改配返回 `422` 且不保存**（中文说明原因，如可用槽不足、承重/堆叠/力矩等约束无法同时满足）；
+- **求解后保存前在 `BEGIN IMMEDIATE` 写锁内再次复核**，任一成立即返回 `409` 且不保存：
+  - 基础方案已被取代（状态不再是 `confirmed`）；
+  - 同方案链（同 `root_id`）出现了更新的方案修订；
+  - 基础方案所用槽位资料/箱清单发生变化（出现更新修订）；
+- 新草稿确认沿用**现有确认规则**：`POST /api/plans/{draft_id}/confirm` 仍须提交其
+  `slots_revision`/`manifest_revision` 并与最新修订核对，仍受槽位唯一占用约束串行化；
+  草稿确认后旧确认修订变为 `superseded` 并转移槽位占用，封锁槽位自然不再被占用；
+- **空箱方案**：封锁任意槽位均返回空草稿，`moved_boxes = 0`。
+
+curl 示例：
+
+```bash
+# 基于当前已确认方案计算应急改配草稿（422=编号非法/无可行改配且不保存；409=未确认/资料过期/保存前已变化）
+curl -s -X POST $BASE/plans/<plan_id>/restow \
+  -H 'Content-Type: application/json' -d @examples/restow.json
+
+# 草稿确认（沿用现有确认与槽位冲突规则；封锁槽不会被新确认占用）
+curl -s -X POST $BASE/plans/<draft_id>/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"slots_revision":1,"manifest_revision":1}'
+```
+
+## 七、启动
 
 ### 方式 A：Docker Compose（推荐，一键启动）
 
@@ -214,7 +301,7 @@ docker build -t stowage-service .
 docker run -d -p 8000:8000 -v stowage-data:/app/data stowage-service
 ```
 
-## 七、配置
+## 八、配置
 
 全部配置通过环境变量覆盖（前缀 `STOWAGE_`，也可用 `.env`）：
 
@@ -224,7 +311,7 @@ docker run -d -p 8000:8000 -v stowage-data:/app/data stowage-service
 | `STOWAGE_DATABASE_URL` | `sqlite:///./data/stowage.db` | SQLAlchemy 数据库地址；容器内固定 `sqlite:////app/data/stowage.db` |
 | `STOWAGE_API_PREFIX` | `/api` | API 路由前缀 |
 
-## 八、地址与端口
+## 九、地址与端口
 
 - 服务地址（本地）：`http://127.0.0.1:8000`
 - 健康检查：`GET http://127.0.0.1:8000/health`
@@ -232,7 +319,7 @@ docker run -d -p 8000:8000 -v stowage-data:/app/data stowage-service
 - 交互式文档（Swagger UI）：`http://127.0.0.1:8000/docs`
 - OpenAPI：`http://127.0.0.1:8000/openapi.json`
 
-## 九、HTTP API
+## 十、HTTP API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -243,6 +330,7 @@ docker run -d -p 8000:8000 -v stowage-data:/app/data stowage-service
 | POST | `/api/plans/compute` | 核算新方案（无解返回 422，不保存） |
 | POST | `/api/plans/{plan_id}/amend` | 基于现有方案重新核算，生成方案修订号 |
 | POST | `/api/plans/{plan_id}/confirm` | 确认方案（核对资料修订，409=过期/冲突） |
+| POST | `/api/plans/{plan_id}/restow` | **应急改配**：基于当前已确认方案与封锁槽位列表生成改配草稿（422=编号非法/无可行改配；409=未确认/资料过期/保存前已变化） |
 | POST | `/api/plans/{plan_id}/schedules` | 为**已确认方案修订**生成装船时间表（无解返回 422，不保存） |
 | GET | `/api/plans/{plan_id}/schedules` | 查询该方案修订绑定的装船时间表（历史排程可查） |
 | GET | `/api/schedules` | 列出装船时间表（默认仅当前；`?historical=true` 含历史） |
@@ -279,10 +367,10 @@ docker run -d -p 8000:8000 -v stowage-data:/app/data stowage-service
 ### 错误处理
 
 - `400/404`：业务错误（修订/方案/排程/卸箱顺序不存在等），中文 `detail`；
-- `409 Conflict`：资料修订过期/不一致、重复确认、并发槽位占用冲突、对未确认方案排程或规划卸箱顺序、排程/卸箱顺序保存前方案已被新修订取代，原数据不变；
-- `422`：① 录入校验失败（非法重量、重复箱号、无效槽位、重复槽位编号、力矩区间倒置、排程箱项缺失/多余、岸桥数/时长非正、时间窗倒置、卸港序号缺失/多余/重复、卸港区间倒置等）；② 无完整可行方案、装船时间窗无解或**无可行逐港卸箱顺序/求解无法确定**（均**不保存**）。
+- `409 Conflict`：资料修订过期/不一致、重复确认、并发槽位占用冲突、对未确认方案排程或规划卸箱顺序、排程/卸箱顺序保存前方案已被新修订取代，原数据不变；**应急改配还在基础方案非已确认、资料非最新、或保存前基础方案被取代/同根出现新修订/资料变化时返回 409，原确认方案仍有效**；
+- `422`：① 录入校验失败（非法重量、重复箱号、无效槽位、重复槽位编号、力矩区间倒置、排程箱项缺失/多余、岸桥数/时长非正、时间窗倒置、卸港序号缺失/多余/重复、卸港区间倒置等，**含应急改配封锁列表为空/重复/空白/编号不属于该槽位修订**）；② 无完整可行方案、装船时间窗无解或**无可行逐港卸箱顺序/求解无法确定**（均**不保存**）；**应急改配无完整可行改配同样返回 422 且不保存**。
 
-## 十、请求示例（curl）
+## 十一、请求示例（curl）
 
 ```bash
 BASE=http://127.0.0.1:8000/api
@@ -330,6 +418,17 @@ curl -s -X POST $BASE/plans/<plan_id>/schedules \
 curl -s -X POST $BASE/plans/<plan_id>/unloading \
   -H 'Content-Type: application/json' -d @examples/unloading.json
 
+# 7.1) 码头临时封锁 B01：基于当前已确认方案生成应急改配草稿（详见第六章）
+#      422=封锁编号非法/无完整可行改配且不保存；409=方案未确认/资料非最新/保存前已变化
+curl -s -X POST $BASE/plans/<plan_id>/restow \
+  -H 'Content-Type: application/json' -d @examples/restow.json
+# -> revision_no=2、status=draft；moved_boxes=1：C002 由 B01 改配到 C01；原确认方案仍 confirmed
+
+# 7.2) 确认应急改配草稿（沿用现有确认与槽位冲突规则；409=资料再变更过期）
+curl -s -X POST $BASE/plans/<draft_id>/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"slots_revision":1,"manifest_revision":1}'
+
 # 8) 查询
 curl -s $BASE/plans
 curl -s $BASE/plans/<plan_id>
@@ -370,16 +469,16 @@ curl -s -X POST $BASE/slot-revisions    -H 'Content-Type: application/json' -d @
 curl -s -X POST $BASE/manifest-revisions -H 'Content-Type: application/json' -d @examples/containers.json
 ```
 
-## 十一、测试
+## 十二、测试
 
 ```bash
 pip install pytest httpx
 PYTHONPATH=. pytest -q
 ```
 
-测试覆盖：配载求解器全部约束与两阶段优选、岸桥调度求解器全部约束与 makespan/字典序优选、逐港卸箱顺序求解器全部约束（逐港/堆栈先后/逐步力矩区间）与全程箱号字典序优选（含 200+ 随机案例穷举交叉验证）、录入校验（非法重量/重复箱号/无效槽位/时间窗倒置/卸港序号不一致与区间倒置）、无解不落库、过期修订拒绝、方案修订链、并发确认互斥、装船排程与卸箱顺序的箱项一致性及历史标记、以及排程/卸箱顺序保存前的方案状态复核（68 个用例）。
+测试覆盖：配载求解器全部约束与两阶段优选、岸桥调度求解器全部约束与 makespan/字典序优选、逐港卸箱顺序求解器全部约束（逐港/堆栈先后/逐步力矩区间）与全程箱号字典序优选（含 200+ 随机案例穷举交叉验证）、**应急改配三阶段优选（最少换槽→最低层级→字典序）与封锁/承重/堆叠/重量次序/卸港/危邻/力矩全约束 Python 复核**、录入校验（非法重量/重复箱号/无效槽位/时间窗倒置/卸港序号不一致与区间倒置/封锁列表空或重复或编号越修订）、无解不落库、过期修订拒绝、方案修订链、并发确认互斥、装船排程与卸箱顺序的箱项一致性及历史标记、以及排程/卸箱顺序/**应急改配**保存前的方案状态/同根新修订/资料变化复核（共 87 个用例）。
 
-## 十二、目录结构
+## 十三、目录结构
 
 ```
 app/
@@ -387,14 +486,14 @@ app/
   database.py    # 引擎/会话/建表，SQLite WAL、外键、busy_timeout
   models.py      # ORM：资料修订、方案、方案项、已确认占用、装船排程、卸箱顺序等
   schemas.py     # Pydantic 模式与录入校验
-  solver.py      # 配载 MILP 建模与两阶段优选（核心）
+  solver.py      # 配载 MILP 与两阶段优选、应急改配三阶段优选（核心）
   scheduler.py   # 装船时间表（岸桥调度）MILP 与两阶段优选（核心）
   unloader.py    # 逐港卸箱顺序 MILP、字典序优选与全约束 Python 复核（核心）
-  services.py    # 业务逻辑、并发安全确认、排程/卸箱顺序保存前复核
+  services.py    # 业务逻辑、并发安全确认、排程/卸箱顺序/应急改配保存前复核
   routers.py     # HTTP 路由
   main.py        # FastAPI 入口
 scripts/entrypoint.sh  # 容器初始化入口
-tests/           # 单元/接口/并发测试（含调度器/卸箱顺序穷举交叉验证）
-examples/        # 请求示例（含 schedule.json、unloading.json）
+tests/           # 单元/接口/并发测试（含调度器/卸箱顺序穷举交叉验证、应急改配）
+examples/        # 请求示例（含 schedule.json、unloading.json、restow.json）
 Dockerfile / docker-compose.yml / requirements.txt
 ```

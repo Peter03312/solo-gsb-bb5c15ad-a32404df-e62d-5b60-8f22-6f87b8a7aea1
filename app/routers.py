@@ -16,6 +16,9 @@ from app.schemas import (
     PlanComputeIn,
     PlanConfirmIn,
     PlanOut,
+    RestowCreateIn,
+    RestowMoveOut,
+    RestowOut,
     ScheduleCreateIn,
     ScheduleEntryOut,
     ScheduleOut,
@@ -171,6 +174,45 @@ def amend_plan(plan_id: str, body: PlanAmendIn, db: Session = Depends(get_db)):
 def confirm_plan(plan_id: str, body: PlanConfirmIn, db: Session = Depends(get_db)):
     plan = services.confirm_plan(db, plan_id, body)
     return _plan_out(plan)
+
+
+# ---------- 应急改配 ----------
+
+
+def _restow_out(data: dict) -> RestowOut:
+    p = data["plan"]
+    plan_view = _plan_out(p)
+    return RestowOut(
+        plan_id=p.id,
+        revision_no=p.revision_no,
+        status=p.status,
+        root_id=p.root_id,
+        parent_id=p.parent_id,
+        slots_revision=p.slots_revision,
+        manifest_revision=p.manifest_revision,
+        blocked_slots=data["blocked_slots"],
+        moved_boxes=len(data["moves"]),
+        max_occupied_tier=p.max_tier,
+        total_moment=p.total_moment,
+        assignments=plan_view.assignments,
+        moves=[RestowMoveOut(**m) for m in data["moves"]],
+        created_at=services.utc_iso(p.created_at),
+    )
+
+
+@router.post(
+    "/plans/{plan_id}/restow",
+    response_model=RestowOut,
+    status_code=201,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="码头临时封锁槽位：计算应急改配草稿（先最少换槽、再最低层级、再字典序）",
+)
+def create_emergency_restow(
+    plan_id: str, body: RestowCreateIn, db: Session = Depends(get_db)
+):
+    data = services.create_emergency_restow(db, plan_id, body)
+    return _restow_out(data)
 
 
 @router.get("/plans", response_model=list[PlanOut], summary="列出全部方案")

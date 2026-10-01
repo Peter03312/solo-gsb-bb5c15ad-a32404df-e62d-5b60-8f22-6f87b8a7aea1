@@ -11,6 +11,7 @@ from app import models
 from app.schemas import (
     ManifestIn,
     PlanConfirmIn,
+    RestowCreateIn,
     ScheduleCreateIn,
     SlotDataIn,
     UnloadingCreateIn,
@@ -20,6 +21,7 @@ from app.solver import (
     Container,
     InfeasibleStowage,
     Slot,
+    solve_restow,
     solve_stowage,
 )
 from app.unloader import (
@@ -378,6 +380,209 @@ def _latest_slot_revision(db: Session) -> int:
 
 def _latest_manifest_revision(db: Session) -> int:
     return db.scalar(select(func.max(models.ManifestRevision.revision))) or 0
+
+
+# ---------- 应急改配 ----------
+
+
+def create_emergency_restow(
+    db: Session,
+    plan_id: str,
+    payload: RestowCreateIn,
+) -> dict:
+    """码头临时封锁槽位：基于当前已确认方案计算应急改配草稿。
+
+    方案所用槽位资料与箱清单须均为当前最新修订；封锁编号须属于该槽位修订；
+    保持全部箱及其资料、封锁槽位不得占用，并满足全部既有配载硬约束。
+    先最小化换槽箱数，再最小化最高占用层，最后按箱号升序取槽位编号序列
+    字典序最小。无完整可行改配返回 422 且不保存；求解后保存前若基础方案
+    被取代、同根出现更新修订或基础资料变化，返回 409 且不保存。
+    """
+    plan = get_plan(db, plan_id)
+    if plan.status != "confirmed":
+        raise ConflictError(
+            f"方案当前状态为 {plan.status}，应急改配仅可基于当前已确认方案"
+        )
+
+    latest_slots = _latest_slot_revision(db)
+    latest_manifest = _latest_manifest_revision(db)
+    if plan.slots_revision != latest_slots:
+        raise ConflictError(
+            f"槽位资料已更新：当前已确认方案基于修订 {plan.slots_revision}，"
+            f"最新修订 {latest_slots}，请先按最新资料修订并确认方案后再申请应急改配"
+        )
+    if plan.manifest_revision != latest_manifest:
+        raise ConflictError(
+            f"箱清单已更新：当前已确认方案基于修订 {plan.manifest_revision}，"
+            f"最新修订 {latest_manifest}，请先按最新资料修订并确认方案后再申请应急改配"
+        )
+
+    slot_rev = get_slot_revision(db, latest_slots)
+    manifest_rev = get_manifest_revision(db, latest_manifest)
+
+    valid_codes = {s.code for s in slot_rev.slots}
+    unknown = sorted({c for c in payload.blocked_slots if c not in valid_codes})
+    if unknown:
+        raise BusinessError(
+            f"封锁槽位编号不属于槽位资料修订 {latest_slots}：{', '.join(unknown)}（无效槽位）",
+            422,
+        )
+
+    # 改配前后箱清单必须与基础方案完全一致（资料须为最新修订）
+    plan_nos = {i.container_no for i in plan.items}
+    manifest_nos = {c.no for c in manifest_rev.containers}
+    if plan_nos != manifest_nos:
+        missing = sorted(plan_nos - manifest_nos)
+        extra = sorted(manifest_nos - plan_nos)
+        problems = []
+        if missing:
+            problems.append(f"方案箱在最新清单中缺失：{', '.join(missing)}")
+        if extra:
+            problems.append(f"最新清单存在方案外箱：{', '.join(extra)}")
+        raise BusinessError(
+            "当前已确认方案箱项与最新箱清单不一致（" + "；".join(problems) + "）",
+            500,
+        )
+
+    slots, containers, adjacency, incompat = _to_solver_inputs(slot_rev, manifest_rev)
+    original = {i.container_no: i.slot_code for i in plan.items}
+    blocked = tuple(sorted(set(payload.blocked_slots)))
+
+    try:
+        result = solve_restow(
+            containers, slots, adjacency, incompat,
+            slot_rev.min_moment, slot_rev.max_moment,
+            original=original, blocked=blocked,
+        )
+    except InfeasibleStowage as exc:
+        raise BusinessError(f"无完整可行改配：{exc.reason}", 422)
+
+    # 求解完成后快照结果并结束只读事务；在独立连接的写锁内复核后落库
+    parent_id = plan.id
+    root_id = plan.root_id
+    parent_rev = plan.revision_no
+    base_slots_rev = latest_slots
+    base_manifest_rev = latest_manifest
+    original_items = tuple(
+        (i.container_no, i.slot_code, i.stack, i.tier)
+        for i in sorted(plan.items, key=lambda x: x.container_no)
+    )
+    item_rows = tuple(
+        (a.container_no, a.slot_code, a.stack, a.tier)
+        for a in result.assignments
+    )
+    total_moment = result.total_moment
+    max_tier = result.max_occupied_tier
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+
+        # 保存前复核：基础方案仍存在且仍为当前已确认修订
+        cursor.execute(
+            "SELECT status, slots_revision, manifest_revision, revision_no, root_id "
+            "FROM plans WHERE id = ?",
+            (parent_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            conn.rollback()
+            raise ConflictError("基础方案在求解期间被删除，应急改配草稿被拒绝且不保存")
+        status_locked, slots_rev_locked, manifest_rev_locked, rev_locked, root_locked = row
+        if status_locked != "confirmed":
+            conn.rollback()
+            raise ConflictError(
+                f"保存前复核发现基础方案状态已为 {status_locked}（可能已被新修订取代），"
+                "应急改配草稿被拒绝且不保存，原确认方案仍有效"
+            )
+        if slots_rev_locked != base_slots_rev or manifest_rev_locked != base_manifest_rev:
+            conn.rollback()
+            raise ConflictError(
+                "保存前复核发现基础方案所用资料已变化（槽位资料修订 "
+                f"{slots_rev_locked}、箱清单修订 {manifest_rev_locked}），"
+                "应急改配草稿被拒绝且不保存，原确认方案仍有效"
+            )
+
+        # 同根出现更新修订（新草稿/新确认）-> 拒绝，由调用方基于最新修订重试
+        cursor.execute(
+            "SELECT id FROM plans WHERE root_id = ? AND revision_no > ? LIMIT 1",
+            (root_locked, rev_locked),
+        )
+        if cursor.fetchone() is not None:
+            conn.rollback()
+            raise ConflictError(
+                f"保存前复核发现同方案链（root={root_locked}）已出现更新修订，"
+                "应急改配草稿被拒绝且不保存，原确认方案仍有效"
+            )
+
+        # 资料在求解期间是否产生新修订
+        cursor.execute("SELECT COALESCE(MAX(revision), 0) FROM slot_revisions")
+        if cursor.fetchone()[0] != base_slots_rev:
+            conn.rollback()
+            raise ConflictError(
+                "保存前复核发现槽位资料已产生新修订，应急改配草稿被拒绝且不保存，"
+                "原确认方案仍有效"
+            )
+        cursor.execute("SELECT COALESCE(MAX(revision), 0) FROM manifest_revisions")
+        if cursor.fetchone()[0] != base_manifest_rev:
+            conn.rollback()
+            raise ConflictError(
+                "保存前复核发现箱清单已产生新修订，应急改配草稿被拒绝且不保存，"
+                "原确认方案仍有效"
+            )
+
+        new_id = models._new_id()
+        new_revision_no = parent_rev + 1
+        now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+        # 草稿不写 confirmed_slots，不影响原确认方案的槽位占用
+        cursor.execute(
+            "INSERT INTO plans "
+            "(id, revision_no, status, slots_revision, manifest_revision, "
+            "total_moment, max_tier, created_at, confirmed_at, parent_id, root_id) "
+            "VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, NULL, ?, ?)",
+            (new_id, new_revision_no, base_slots_rev, base_manifest_rev,
+             total_moment, max_tier, now, parent_id, root_id),
+        )
+        cursor.executemany(
+            "INSERT INTO plan_items (plan_id, container_no, slot_code, stack, tier) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [(new_id, *r4) for r4 in item_rows],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    new_plan = get_plan(db, new_id)
+
+    orig_by_no = {cno: (scode, stack, tier) for cno, scode, stack, tier in original_items}
+    moves = []
+    for item in sorted(new_plan.items, key=lambda x: x.container_no):
+        from_code, from_stack, from_tier = orig_by_no[item.container_no]
+        if from_code != item.slot_code:
+            moves.append({
+                "container_no": item.container_no,
+                "from_slot_code": from_code,
+                "to_slot_code": item.slot_code,
+                "from_stack": from_stack,
+                "to_stack": item.stack,
+                "from_tier": from_tier,
+                "to_tier": item.tier,
+            })
+
+    return {
+        "plan": new_plan,
+        "blocked_slots": list(blocked),
+        "moves": moves,
+    }
 
 
 # ---------- 装船时间表 ----------
